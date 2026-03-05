@@ -278,7 +278,7 @@ Default: option 3 (public local endpoint) for simplicity on private LANs. Bearer
 
 ### HKSV Compatibility
 
-HomeKit Secure Video recordings are managed by the HomeKit plugin's VideoClipsMixinProvider. This plugin can access HKSV clips the same way it accesses NVR clips — through the VideoClips interface on the device. No special handling needed since HKSV clips appear as standard VideoClip objects.
+HomeKit Secure Video recordings are stored in iCloud and are **NOT programmatically accessible** from the Scrypted side. This plugin cannot retrieve HKSV clips. Its recording access is specifically for Scrypted NVR recordings (the paid NVR plugin). Live snapshots via `Camera.takePicture()` work regardless of NVR/HKSV status.
 
 ## Implementation Plan
 
