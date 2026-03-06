@@ -14,18 +14,24 @@ import sdk, {
     RecordingStreamThumbnailOptions,
 } from '@scrypted/sdk';
 
-const { systemManager, mediaManager } = sdk;
+const { systemManager, mediaManager, endpointManager } = sdk;
 
 /**
  * Parse a route from a Scrypted endpoint URL.
  * Scrypted delivers URLs in the form /endpoint/{package-name}/{route}?{query}
+ * Public endpoints add a /public/ segment: /endpoint/{package-name}/public/{route}?{query}
  */
 export function parseRoute(url: string): { path: string; params: URLSearchParams } {
     // Handle both unscoped (/endpoint/pkg/...) and scoped (/endpoint/@scope/pkg/...) packages
     const pathMatch = url.match(/\/endpoint\/(?:@[^/]+\/)?[^/]+\/(.+?)(?:\?(.*))?$/);
     if (pathMatch) {
+        let path = pathMatch[1];
+        // Strip leading "public/" prefix added by Scrypted's public endpoint routing
+        if (path.startsWith('public/')) {
+            path = path.substring(7);
+        }
         return {
-            path: pathMatch[1],
+            path,
             params: new URLSearchParams(pathMatch[2] || ''),
         };
     }
@@ -195,6 +201,12 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
             // GET /health
             if (path === 'health') {
                 this.sendJson(response, { status: 'ok', version: '0.0.1' });
+                return;
+            }
+
+            // GET /public-url — returns the public (no-auth) endpoint base URL
+            if (path === 'public-url') {
+                await this.handlePublicUrl(response);
                 return;
             }
 
@@ -371,6 +383,18 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
                 ...CORS_HEADERS,
             },
         });
+    }
+
+    /**
+     * Returns public (unauthenticated) endpoint URLs for this plugin.
+     * HA can use these base URLs to fetch snapshots without Scrypted auth.
+     */
+    private async handlePublicUrl(response: HttpResponse): Promise<void> {
+        const [insecureUrl, secureUrl] = await Promise.all([
+            endpointManager.getLocalEndpoint(undefined, { public: true, insecure: true }),
+            endpointManager.getLocalEndpoint(undefined, { public: true }),
+        ]);
+        this.sendJson(response, { insecureUrl, secureUrl });
     }
 
     /**

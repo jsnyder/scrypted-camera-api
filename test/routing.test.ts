@@ -30,6 +30,17 @@ describe('parseRoute', () => {
         const result = parseRoute('/endpoint/@scope/scrypted-camera-api/snapshot/xyz');
         expect(result.path).toBe('snapshot/xyz');
     });
+
+    it('strips public/ prefix from public endpoint URLs', () => {
+        const result = parseRoute('/endpoint/scrypted-camera-api/public/health');
+        expect(result.path).toBe('health');
+    });
+
+    it('strips public/ prefix from public snapshot URLs', () => {
+        const result = parseRoute('/endpoint/scrypted-camera-api/public/snapshot/147?width=640');
+        expect(result.path).toBe('snapshot/147');
+        expect(result.params.get('width')).toBe('640');
+    });
 });
 
 describe('matchRoute', () => {
