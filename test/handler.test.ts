@@ -85,7 +85,7 @@ describe('ScryptedCameraApi handler', () => {
             await plugin.onRequest(req, res);
             const body = JSON.parse(res._sent);
             expect(body.status).toBe('ok');
-            expect(body.version).toBe('0.0.1');
+            expect(body.version).toBe('0.1.0');
         });
     });
 

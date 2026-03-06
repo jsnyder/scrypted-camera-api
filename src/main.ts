@@ -200,7 +200,7 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
 
             // GET /health
             if (path === 'health') {
-                this.sendJson(response, { status: 'ok', version: '0.0.1' });
+                this.sendJson(response, { status: 'ok', version: '0.1.0' });
                 return;
             }
 
