@@ -13,6 +13,13 @@ import sdk, {
     MediaObject,
     RecordingStreamThumbnailOptions,
 } from '@scrypted/sdk';
+import child_process from 'child_process';
+
+interface FFmpegInput {
+    url?: string;
+    inputArguments?: string[];
+    mediaStreamUrl?: string;
+}
 
 const { systemManager, mediaManager, endpointManager } = sdk;
 
@@ -180,6 +187,12 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
                 return;
             }
 
+            // GET /audio/:deviceId — WAV audio extraction from recordings
+            if ((match = matchRoute('audio/:deviceId', path))) {
+                await this.handleAudioExport(match.deviceId, params, response);
+                return;
+            }
+
             // GET /clips/:deviceId — list NVR clips (JSON)
             if ((match = matchRoute('clips/:deviceId', path))) {
                 await this.handleClipsList(match.deviceId, params, response);
@@ -325,6 +338,99 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
             headers: {
                 'Content-Type': 'video/mp4',
                 'Content-Disposition': `attachment; filename="clip_${deviceId}_${start}.mp4"`,
+                ...CORS_HEADERS,
+            },
+        });
+    }
+
+    /**
+     * Extract 16kHz mono WAV audio from NVR recordings via ffmpeg.
+     * Bypasses Scrypted's media converter chain (which may lack MP4 muxing)
+     * by getting the raw ffmpeg input spec and running ffmpeg directly.
+     */
+    private async handleAudioExport(deviceId: string, params: URLSearchParams, response: HttpResponse): Promise<void> {
+        const device = this.getDevice(deviceId);
+        if (!device) {
+            this.sendError(response, 404, `Device not found: ${deviceId}`);
+            return;
+        }
+        if (!deviceHasInterface(device, ScryptedInterface.VideoRecorder)) {
+            this.sendError(response, 400, `Device ${deviceId} does not implement VideoRecorder (NVR plugin required)`);
+            return;
+        }
+
+        const start = parseInt(params.get('start') || '');
+        if (!start) {
+            this.sendError(response, 400, 'Missing required parameter: start (epoch ms)');
+            return;
+        }
+
+        const end = parseInt(params.get('end') || '');
+        const duration = parseInt(params.get('duration') || '') || (end ? end - start : 60000);
+
+        // Cap at 5 minutes
+        const maxDuration = 5 * 60 * 1000;
+        const safeDuration = Math.min(duration, maxDuration);
+
+        const recorder = device as VideoRecorder;
+        const recording: MediaObject = await recorder.getRecordingStream({
+            startTime: start,
+            duration: safeDuration,
+        });
+
+        // Get the ffmpeg input specification from the MediaObject
+        const ffmpegInputBuffer = await mediaManager.convertMediaObjectToBuffer(
+            recording, 'x-scrypted/x-ffmpeg-input'
+        );
+        const ffmpegInput: FFmpegInput = JSON.parse(ffmpegInputBuffer.toString());
+
+        // Build ffmpeg args: input from recording, output as 16kHz mono WAV to stdout
+        const inputArgs = ffmpegInput.inputArguments || [];
+        const ffmpegArgs = [
+            ...inputArgs,
+            '-vn',                  // no video
+            '-acodec', 'pcm_s16le', // 16-bit PCM
+            '-ar', '16000',         // 16kHz sample rate
+            '-ac', '1',             // mono
+            '-f', 'wav',            // WAV format
+            'pipe:1',               // output to stdout
+        ];
+
+        // Run ffmpeg and collect output
+        const wav = await new Promise<Buffer>((resolve, reject) => {
+            const ffmpegPath = process.env.SCRYPTED_FFMPEG_PATH || 'ffmpeg';
+            const proc = child_process.spawn(ffmpegPath, ffmpegArgs, {
+                stdio: ['pipe', 'pipe', 'pipe'],
+            });
+
+            const chunks: Buffer[] = [];
+            proc.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+
+            let stderr = '';
+            proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+
+            proc.on('close', (code) => {
+                if (code === 0) {
+                    resolve(Buffer.concat(chunks));
+                } else {
+                    this.console.error(`ffmpeg failed (rc=${code}): ${stderr.slice(-500)}`);
+                    reject(new Error(`ffmpeg exited with code ${code}`));
+                }
+            });
+
+            proc.on('error', reject);
+
+            // Timeout after 120 seconds
+            setTimeout(() => {
+                proc.kill('SIGKILL');
+                reject(new Error('ffmpeg timed out'));
+            }, 120_000);
+        });
+
+        response.send(wav, {
+            headers: {
+                'Content-Type': 'audio/wav',
+                'Content-Disposition': `attachment; filename="audio_${deviceId}_${start}.wav"`,
                 ...CORS_HEADERS,
             },
         });
