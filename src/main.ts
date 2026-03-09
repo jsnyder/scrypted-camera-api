@@ -389,6 +389,7 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
         const ffmpegArgs = [
             ...inputArgs,
             '-vn',                  // no video
+            '-t', (safeDuration / 1000).toString(), // truncate to exact requested duration
             '-acodec', 'pcm_s16le', // 16-bit PCM
             '-ar', '16000',         // 16kHz sample rate
             '-ac', '1',             // mono
