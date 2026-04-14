@@ -1,6 +1,6 @@
 {
   "name": "scrypted-camera-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Scrypted plugin exposing a low-latency REST API for camera snapshots, NVR clip retrieval, recording thumbnails, and frame extraction",
   "keywords": [
     "scrypted",

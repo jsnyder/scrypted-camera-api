@@ -6,6 +6,7 @@ import sdk, {
     Settings,
     Setting,
     Camera,
+    VideoCamera,
     VideoClips,
     VideoRecorder,
     ScryptedInterface,
@@ -17,6 +18,7 @@ import child_process from 'child_process';
 
 interface FFmpegInput {
     url?: string;
+    urls?: string[];
     inputArguments?: string[];
     mediaStreamUrl?: string;
 }
@@ -205,6 +207,18 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
                 return;
             }
 
+            // GET /stream/:deviceId — RTSP/stream URL for a single camera
+            if ((match = matchRoute('stream/:deviceId', path))) {
+                await this.handleStreamUrl(match.deviceId, response);
+                return;
+            }
+
+            // GET /streams — RTSP/stream URLs for all cameras
+            if (path === 'streams') {
+                await this.handleStreamUrls(response);
+                return;
+            }
+
             // GET /devices — list cameras
             if (path === 'devices') {
                 await this.handleListDevices(response);
@@ -213,7 +227,7 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
 
             // GET /health
             if (path === 'health') {
-                this.sendJson(response, { status: 'ok', version: '0.1.0' });
+                this.sendJson(response, { status: 'ok', version: '0.2.0' });
                 return;
             }
 
@@ -236,7 +250,7 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
      * Live JPEG snapshot from camera, bypassing go2rtc/RTSP chain.
      * Uses Camera.takePicture() directly on the Scrypted device.
      */
-    private async handleSnapshot(deviceId: string, params: URLSearchParams, response: HttpResponse): Promise<void> {
+    private async handleSnapshot(deviceId: string, _params: URLSearchParams, response: HttpResponse): Promise<void> {
         const device = this.getDevice(deviceId);
         if (!device) {
             this.sendError(response, 404, `Device not found: ${deviceId}`);
@@ -323,6 +337,11 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
         const end = parseInt(params.get('end') || '');
         const duration = parseInt(params.get('duration') || '') || (end ? end - start : 60000);
 
+        if (!duration || duration <= 0) {
+            this.sendError(response, 400, 'Invalid duration: must be a positive number of milliseconds');
+            return;
+        }
+
         // Cap at 5 minutes to avoid OOM until streaming is implemented
         const maxDuration = 5 * 60 * 1000;
         const safeDuration = Math.min(duration, maxDuration);
@@ -333,11 +352,12 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
             duration: safeDuration,
         });
 
+        const safeDeviceId = deviceId.replace(/[^a-zA-Z0-9_-]/g, '_');
         const buffer = await mediaManager.convertMediaObjectToBuffer(recording, 'video/mp4');
         response.send(Buffer.from(buffer), {
             headers: {
                 'Content-Type': 'video/mp4',
-                'Content-Disposition': `attachment; filename="clip_${deviceId}_${start}.mp4"`,
+                'Content-Disposition': `attachment; filename="clip_${safeDeviceId}_${start}.mp4"`,
                 ...CORS_HEADERS,
             },
         });
@@ -368,6 +388,11 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
         const end = parseInt(params.get('end') || '');
         const duration = parseInt(params.get('duration') || '') || (end ? end - start : 60000);
 
+        if (!duration || duration <= 0) {
+            this.sendError(response, 400, 'Invalid duration: must be a positive number of milliseconds');
+            return;
+        }
+
         // Cap at 5 minutes
         const maxDuration = 5 * 60 * 1000;
         const safeDuration = Math.min(duration, maxDuration);
@@ -384,8 +409,14 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
         );
         const ffmpegInput: FFmpegInput = JSON.parse(ffmpegInputBuffer.toString());
 
-        // Build ffmpeg args: input from recording, output as 16kHz mono WAV to stdout
+        // Validate that the ffmpeg input spec contains an input source
         const inputArgs = ffmpegInput.inputArguments || [];
+        if (inputArgs.length === 0) {
+            this.sendError(response, 500, 'Recording returned empty ffmpeg input specification');
+            return;
+        }
+
+        // Build ffmpeg args: input from recording, output as 16kHz mono WAV to stdout
         const ffmpegArgs = [
             ...inputArgs,
             '-vn',                  // no video
@@ -410,7 +441,14 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
             let stderr = '';
             proc.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
 
+            // Timeout after 120 seconds
+            const timer = setTimeout(() => {
+                proc.kill('SIGKILL');
+                reject(new Error('ffmpeg timed out'));
+            }, 120_000);
+
             proc.on('close', (code) => {
+                clearTimeout(timer);
                 if (code === 0) {
                     resolve(Buffer.concat(chunks));
                 } else {
@@ -419,19 +457,17 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
                 }
             });
 
-            proc.on('error', reject);
-
-            // Timeout after 120 seconds
-            setTimeout(() => {
-                proc.kill('SIGKILL');
-                reject(new Error('ffmpeg timed out'));
-            }, 120_000);
+            proc.on('error', (err) => {
+                clearTimeout(timer);
+                reject(err);
+            });
         });
 
+        const safeDeviceId = deviceId.replace(/[^a-zA-Z0-9_-]/g, '_');
         response.send(wav, {
             headers: {
                 'Content-Type': 'audio/wav',
-                'Content-Disposition': `attachment; filename="audio_${deviceId}_${start}.wav"`,
+                'Content-Disposition': `attachment; filename="audio_${safeDeviceId}_${start}.wav"`,
                 ...CORS_HEADERS,
             },
         });
@@ -502,6 +538,125 @@ class ScryptedCameraApi extends ScryptedDeviceBase implements HttpRequestHandler
             endpointManager.getLocalEndpoint(undefined, { public: true }),
         ]);
         this.sendJson(response, { insecureUrl, secureUrl });
+    }
+
+    /**
+     * Get the current RTSP rebroadcast URL for a single camera.
+     * Uses VideoCamera.getVideoStream() → FFmpegInput to discover the URL
+     * that Scrypted's rebroadcast prebuffer is serving on.
+     */
+    private async handleStreamUrl(deviceId: string, response: HttpResponse): Promise<void> {
+        const device = this.getDevice(deviceId);
+        if (!device) {
+            this.sendError(response, 404, `Device not found: ${deviceId}`);
+            return;
+        }
+        if (!deviceHasInterface(device, ScryptedInterface.VideoCamera)) {
+            this.sendError(response, 400, `Device ${deviceId} does not implement VideoCamera`);
+            return;
+        }
+
+        const streamInfo = await this.getStreamInfo(device, deviceId);
+        this.sendJson(response, streamInfo);
+    }
+
+    /**
+     * Get current RTSP rebroadcast URLs for all cameras.
+     * Returns an array of stream info objects with device ID, name, and URLs.
+     */
+    private async handleStreamUrls(response: HttpResponse): Promise<void> {
+        const allDevices = systemManager.getSystemState();
+        const results: Array<{
+            id: string;
+            name: string;
+            streams: Array<{ id: string; name: string; url?: string; urls?: string[] }>;
+            error?: string;
+        }> = [];
+
+        const promises: Promise<void>[] = [];
+
+        for (const [id, deviceState] of Object.entries(allDevices)) {
+            const interfaces: string[] = (deviceState as any)?.interfaces?.value || [];
+            if (!interfaces.includes(ScryptedInterface.VideoCamera)) continue;
+
+            const name = (deviceState as any)?.name?.value || id;
+            const device = this.getDevice(id);
+            if (!device) continue;
+
+            promises.push(
+                this.getStreamInfo(device, id)
+                    .then(info => { results.push({ id, name, ...info }); })
+                    .catch(e => {
+                        results.push({ id, name, streams: [], error: e.message });
+                    })
+            );
+        }
+
+        await Promise.all(promises);
+        results.sort((a, b) => a.name.localeCompare(b.name));
+        this.sendJson(response, results);
+    }
+
+    /**
+     * Race a promise against a timeout.
+     */
+    private withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+        return new Promise<T>((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error(`Timeout after ${ms}ms: ${label}`)), ms);
+            promise.then(
+                v => { clearTimeout(timer); resolve(v); },
+                e => { clearTimeout(timer); reject(e); },
+            );
+        });
+    }
+
+    /**
+     * Extract stream URLs from a VideoCamera device by querying available
+     * stream options and converting each to an FFmpegInput to get the URL.
+     * Each stream negotiation is capped at 10s to avoid blocking on offline cameras.
+     */
+    private async getStreamInfo(device: any, deviceId: string): Promise<{
+        streams: Array<{ id: string; name: string; url?: string; urls?: string[]; error?: string }>;
+    }> {
+        const videoCamera = device as VideoCamera;
+        const streamOptions = await this.withTimeout(
+            videoCamera.getVideoStreamOptions(),
+            10_000,
+            `getVideoStreamOptions for ${deviceId}`,
+        );
+        const streams: Array<{ id: string; name: string; url?: string; urls?: string[]; error?: string }> = [];
+
+        for (const opt of streamOptions) {
+            try {
+                const mediaObject: MediaObject = await this.withTimeout(
+                    videoCamera.getVideoStream({ id: opt.id }),
+                    10_000,
+                    `getVideoStream for ${deviceId}/${opt.id}`,
+                );
+                const ffmpegInputBuffer = await this.withTimeout(
+                    mediaManager.convertMediaObjectToBuffer(mediaObject, 'x-scrypted/x-ffmpeg-input'),
+                    10_000,
+                    `convertMediaObject for ${deviceId}/${opt.id}`,
+                );
+                const ffmpegInput: FFmpegInput = JSON.parse(ffmpegInputBuffer.toString());
+
+                streams.push({
+                    id: opt.id,
+                    name: opt.name || opt.id,
+                    url: ffmpegInput.url,
+                    urls: ffmpegInput.urls,
+                });
+            } catch (e: any) {
+                this.console.warn(`Failed to get stream URL for ${deviceId}/${opt.id}: ${e.message}`);
+                streams.push({
+                    id: opt.id,
+                    name: opt.name || opt.id,
+                    error: e.message,
+                });
+            }
+        }
+
+        return { streams };
     }
 
     /**

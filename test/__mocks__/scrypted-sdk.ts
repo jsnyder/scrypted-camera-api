@@ -78,3 +78,4 @@ export type VideoRecorder = any;
 export type VideoClipOptions = any;
 export type MediaObject = any;
 export type RecordingStreamThumbnailOptions = any;
+export type VideoCamera = any;

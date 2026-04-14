@@ -85,7 +85,7 @@ describe('ScryptedCameraApi handler', () => {
             await plugin.onRequest(req, res);
             const body = JSON.parse(res._sent);
             expect(body.status).toBe('ok');
-            expect(body.version).toBe('0.1.0');
+            expect(body.version).toBe('0.2.0');
         });
     });
 
@@ -228,6 +228,127 @@ describe('ScryptedCameraApi handler', () => {
                 startTime: 1000,
                 duration: 300000,
             });
+        });
+    });
+
+    describe('GET /stream/:deviceId', () => {
+        it('returns 404 for unknown device', async () => {
+            mockSystemManager.getDeviceById.mockReturnValue(undefined);
+            const req = mockRequest('/endpoint/scrypted-camera-api/stream/nonexistent');
+            const res = mockResponse();
+            await plugin.onRequest(req, res);
+            expect(res._code).toBe(404);
+        });
+
+        it('returns 400 if device lacks VideoCamera interface', async () => {
+            mockSystemManager.getDeviceById.mockReturnValue({
+                interfaces: ['MotionSensor'],
+            });
+            const req = mockRequest('/endpoint/scrypted-camera-api/stream/sensor1');
+            const res = mockResponse();
+            await plugin.onRequest(req, res);
+            expect(res._code).toBe(400);
+            expect(JSON.parse(res._sent).error).toContain('VideoCamera');
+        });
+
+        it('returns stream URLs from ffmpeg input', async () => {
+            const mockGetVideoStreamOptions = jest.fn().mockResolvedValue([
+                { id: 'stream-0', name: 'Main Stream' },
+                { id: 'stream-1', name: 'Sub Stream' },
+            ]);
+            const mockGetVideoStream = jest.fn().mockResolvedValue({ mimeType: 'video/mp4' });
+            mockSystemManager.getDeviceById.mockReturnValue({
+                interfaces: ['VideoCamera'],
+                getVideoStreamOptions: mockGetVideoStreamOptions,
+                getVideoStream: mockGetVideoStream,
+            });
+
+            const ffmpegInput = JSON.stringify({
+                url: 'rtsp://localhost:40001/cam1',
+                urls: ['rtsp://localhost:40001/cam1', 'rtsp://localhost:40002/cam1'],
+                inputArguments: ['-i', 'rtsp://localhost:40001/cam1'],
+            });
+            mockMediaManager.convertMediaObjectToBuffer.mockResolvedValue(
+                Buffer.from(ffmpegInput)
+            );
+
+            const req = mockRequest('/endpoint/scrypted-camera-api/stream/cam1');
+            const res = mockResponse();
+            await plugin.onRequest(req, res);
+
+            expect(res._code).toBe(200);
+            const body = JSON.parse(res._sent);
+            expect(body.streams).toHaveLength(2);
+            expect(body.streams[0].id).toBe('stream-0');
+            expect(body.streams[0].url).toBe('rtsp://localhost:40001/cam1');
+            expect(body.streams[1].id).toBe('stream-1');
+        });
+    });
+
+    describe('GET /streams', () => {
+        it('returns stream URLs for all VideoCamera devices', async () => {
+            mockSystemManager.getSystemState.mockReturnValue({
+                'cam1': {
+                    interfaces: { value: ['VideoCamera'] },
+                    name: { value: 'Front Door' },
+                },
+                'sensor1': {
+                    interfaces: { value: ['MotionSensor'] },
+                    name: { value: 'Motion' },
+                },
+            });
+
+            const mockDevice = {
+                interfaces: ['VideoCamera'],
+                getVideoStreamOptions: jest.fn().mockResolvedValue([
+                    { id: 'default', name: 'Default' },
+                ]),
+                getVideoStream: jest.fn().mockResolvedValue({ mimeType: 'video/mp4' }),
+            };
+            mockSystemManager.getDeviceById.mockReturnValue(mockDevice);
+
+            const ffmpegInput = JSON.stringify({
+                url: 'rtsp://localhost:40001/cam1',
+            });
+            mockMediaManager.convertMediaObjectToBuffer.mockResolvedValue(
+                Buffer.from(ffmpegInput)
+            );
+
+            const req = mockRequest('/endpoint/scrypted-camera-api/streams');
+            const res = mockResponse();
+            await plugin.onRequest(req, res);
+
+            expect(res._code).toBe(200);
+            const body = JSON.parse(res._sent);
+            expect(body).toHaveLength(1);
+            expect(body[0].id).toBe('cam1');
+            expect(body[0].name).toBe('Front Door');
+            expect(body[0].streams[0].url).toBe('rtsp://localhost:40001/cam1');
+        });
+
+        it('includes error info when a camera stream fails', async () => {
+            mockSystemManager.getSystemState.mockReturnValue({
+                'cam1': {
+                    interfaces: { value: ['VideoCamera'] },
+                    name: { value: 'Broken Cam' },
+                },
+            });
+
+            const mockDevice = {
+                interfaces: ['VideoCamera'],
+                getVideoStreamOptions: jest.fn().mockRejectedValue(new Error('stream offline')),
+            };
+            mockSystemManager.getDeviceById.mockReturnValue(mockDevice);
+
+            const req = mockRequest('/endpoint/scrypted-camera-api/streams');
+            const res = mockResponse();
+            await plugin.onRequest(req, res);
+
+            expect(res._code).toBe(200);
+            const body = JSON.parse(res._sent);
+            expect(body).toHaveLength(1);
+            expect(body[0].error).toBe('stream offline');
+            expect(body[0].streams).toEqual([]);
         });
     });
 
